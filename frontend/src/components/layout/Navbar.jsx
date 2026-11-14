@@ -1,17 +1,19 @@
 import { NavLink } from 'react-router-dom';
-import { Flame, LayoutDashboard, Monitor, BarChart3, History, Settings, Radio } from 'lucide-react';
+import { Flame, LayoutDashboard, Monitor, BarChart3, History, Settings, Radio, Workflow, SlidersHorizontal, Film } from 'lucide-react';
 import { useState, useEffect } from 'react';
 import StatusIndicator from '../common/StatusIndicator';
 
 const navLinks = [
-  { to: '/', label: 'Dashboard', icon: LayoutDashboard },
-  { to: '/live', label: 'Live Monitoring', icon: Monitor },
+  { to: '/', label: 'Pipeline', icon: Workflow, end: true },
+  { to: '/dashboard', label: 'Dashboard', icon: LayoutDashboard },
+  { to: '/live', label: 'Live', icon: Monitor },
   { to: '/analytics', label: 'Analytics', icon: BarChart3 },
-  { to: '/history', label: 'Event History', icon: History },
+  { to: '/history', label: 'Incidents', icon: History },
   { to: '/settings', label: 'Settings', icon: Settings },
+  { to: '/presenter', label: 'Presenter', icon: SlidersHorizontal },
 ];
 
-export default function Navbar({ isConnected, demoMode }) {
+export default function Navbar({ isConnected, demoMode, cameraSource }) {
   const [currentTime, setCurrentTime] = useState(new Date());
 
   useEffect(() => {
@@ -49,10 +51,11 @@ export default function Navbar({ isConnected, demoMode }) {
 
         {/* Navigation Links */}
         <div className="hidden md:flex items-center gap-1">
-          {navLinks.map(({ to, label, icon: Icon }) => (
+          {navLinks.map(({ to, label, icon: Icon, end }) => (
             <NavLink
               key={to}
               to={to}
+              end={end}
               className={({ isActive }) =>
                 `flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-all duration-200 ${
                   isActive
@@ -69,14 +72,20 @@ export default function Navbar({ isConnected, demoMode }) {
 
         {/* Right Side */}
         <div className="flex items-center gap-3">
+          {cameraSource === 'scenario' && (
+            <div title="Camera is replaced by presenter-controlled video clips" className="hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-yellow-500/10 border border-yellow-500/20">
+              <Film className="w-3 h-3 text-yellow-400" />
+              <span className="text-[10px] font-semibold uppercase tracking-wider text-yellow-400">Sim video</span>
+            </div>
+          )}
           {demoMode && (
-            <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-yellow-500/10 border border-yellow-500/20">
+            <div title="MQ-2 smoke sensor and TF-Luna LiDAR are simulated" className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-yellow-500/10 border border-yellow-500/20">
               <Radio className="w-3 h-3 text-yellow-400" />
-              <span className="text-[10px] font-semibold uppercase tracking-wider text-yellow-400">Demo</span>
+              <span className="text-[10px] font-semibold uppercase tracking-wider text-yellow-400">Sim sensors</span>
             </div>
           )}
 
-          <div className="hidden lg:flex flex-col items-end">
+          <div className="hidden 2xl:flex flex-col items-end">
             <span className="text-[10px] text-gray-500">{formattedDate}</span>
             <span className="text-xs font-mono text-gray-300 tabular-nums">{formattedTime}</span>
           </div>

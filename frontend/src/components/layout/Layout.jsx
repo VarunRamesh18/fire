@@ -14,7 +14,8 @@ export default function Layout({ children }) {
   return (
     <TelemetryContext.Provider value={telemetryData}>
       <div className="min-h-screen bg-[#0f1419]">
-        <Navbar isConnected={telemetryData.isConnected} demoMode={telemetryData.demoMode} />
+        <Navbar isConnected={telemetryData.isConnected} demoMode={telemetryData.demoMode}
+          cameraSource={telemetryData.latestTelemetry?.camera_source} />
         <main className="pt-16 pb-8 px-4 max-w-[1920px] mx-auto">
           {children}
         </main>

@@ -1,0 +1,50 @@
+[
+  {
+    "id": "bonfire",
+    "label": "Outdoor bonfire (heavy smoke)",
+    "file": "bonfire.mp4",
+    "kind": "fire",
+    "smoke_factor": 1.3,
+    "width": 540,
+    "height": 960,
+    "fps": 29.97,
+    "frames": 485,
+    "seconds": 16.2
+  },
+  {
+    "id": "campfire",
+    "label": "Campfire (light smoke)",
+    "file": "campfire.mp4",
+    "kind": "fire",
+    "smoke_factor": 0.8,
+    "width": 540,
+    "height": 960,
+    "fps": 30.0,
+    "frames": 856,
+    "seconds": 28.5
+  },
+  {
+    "id": "highway",
+    "label": "Highway - normal scene",
+    "file": "highway.mp4",
+    "kind": "normal",
+    "smoke_factor": 1.0,
+    "width": 960,
+    "height": 540,
+    "fps": 25.0,
+    "frames": 1060,
+    "seconds": 42.4
+  },
+  {
+    "id": "city-road",
+    "label": "City road - normal scene",
+    "file": "city-road.mp4",
+    "kind": "normal",
+    "smoke_factor": 1.0,
+    "width": 960,
+    "height": 540,
+    "fps": 24.0,
+    "frames": 1001,
+    "seconds": 41.7
+  }
+]

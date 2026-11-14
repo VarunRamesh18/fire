@@ -1,16 +1,19 @@
 """
-FireGuard AI - SQLite Database Layer
+FireGuard AI - SQLite storage.
 
-Provides async database operations for storing and querying detection events.
-Uses aiosqlite for non-blocking I/O.
+* ``transitions`` - one row per pipeline state change (not per frame).
+* ``incidents``   - one row per incident with outcome, key metrics and full timeline.
+
+All timestamps are ISO-8601 UTC with an explicit offset, so browsers convert
+them to local time correctly.
 """
 
 from __future__ import annotations
 
 import csv
 import io
+import json
 import logging
-from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import aiosqlite
@@ -19,222 +22,179 @@ from app.config import settings
 
 logger = logging.getLogger("fireguard.database")
 
-_db_path: str = settings.DB_PATH
-_connection: Optional[aiosqlite.Connection] = None
+_conn: Optional[aiosqlite.Connection] = None
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS transitions (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp     TEXT NOT NULL,
+    incident_id   TEXT,
+    from_state    TEXT NOT NULL,
+    to_state      TEXT NOT NULL,
+    note          TEXT,
+    confidence    REAL,
+    smoke_ppm     REAL,
+    distance_m    REAL,
+    pressure_bar  REAL
+);
+CREATE INDEX IF NOT EXISTS idx_transitions_ts ON transitions(timestamp);
+CREATE TABLE IF NOT EXISTS incidents (
+    id                 TEXT PRIMARY KEY,
+    started_at         TEXT NOT NULL,
+    ended_at           TEXT NOT NULL,
+    outcome            TEXT NOT NULL,
+    reason             TEXT,
+    duration_s         REAL,
+    peak_confidence    REAL,
+    t_confirmed_s      REAL,
+    t_suppression_s    REAL,
+    t_extinguished_s   REAL,
+    distance_m         REAL,
+    pump_pressure_bar  REAL,
+    flow_lpm           REAL,
+    water_used_l       REAL,
+    metrics_json       TEXT NOT NULL,
+    timeline_json      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_incidents_started ON incidents(started_at);
+"""
 
 
-async def init_db() -> None:
-    """Initialise the SQLite database and create tables if they don't exist."""
-    global _connection
-    try:
-        _connection = await aiosqlite.connect(_db_path)
-        _connection.row_factory = aiosqlite.Row
-        await _connection.execute("""
-            CREATE TABLE IF NOT EXISTS events (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp       TEXT    NOT NULL,
-                fire_detected   INTEGER NOT NULL DEFAULT 0,
-                confidence      REAL    NOT NULL DEFAULT 0.0,
-                distance_m      REAL,
-                pressure_bar    REAL,
-                pressure_psi    REAL,
-                duration        REAL    NOT NULL DEFAULT 0.0,
-                system_state    TEXT    NOT NULL DEFAULT 'MONITORING',
-                smoke_triggered INTEGER NOT NULL DEFAULT 0
-            )
-        """)
-        await _connection.commit()
-        logger.info("Database initialised at %s", _db_path)
-    except Exception as exc:
-        logger.error("Failed to initialise database: %s", exc)
-        raise
+async def init_db(path: Optional[str] = None) -> None:
+    global _conn
+    _conn = await aiosqlite.connect(str(settings.path(path or settings.DB_PATH)))
+    _conn.row_factory = aiosqlite.Row
+    await _conn.executescript(SCHEMA)
+    await _conn.commit()
+    logger.info("Database ready at %s", settings.path(path or settings.DB_PATH))
 
 
 async def close_db() -> None:
-    """Close the database connection cleanly."""
-    global _connection
-    if _connection is not None:
-        await _connection.close()
-        _connection = None
-        logger.info("Database connection closed.")
+    global _conn
+    if _conn is not None:
+        await _conn.close()
+        _conn = None
 
 
-async def _get_conn() -> aiosqlite.Connection:
-    """Return the current connection, re-opening if necessary."""
-    global _connection
-    if _connection is None:
-        _connection = await aiosqlite.connect(_db_path)
-        _connection.row_factory = aiosqlite.Row
-    return _connection
+def _db() -> aiosqlite.Connection:
+    if _conn is None:
+        raise RuntimeError("Database not initialised")
+    return _conn
 
 
-async def save_event(
-    fire_detected: bool,
-    confidence: float,
-    distance_m: Optional[float],
-    pressure_bar: Optional[float],
-    pressure_psi: Optional[float],
-    duration: float,
-    system_state: str,
-    smoke_triggered: bool,
-) -> int:
-    """Persist a detection event and return its row id."""
-    conn = await _get_conn()
-    try:
-        cursor = await conn.execute(
-            """
-            INSERT INTO events
-                (timestamp, fire_detected, confidence, distance_m,
-                 pressure_bar, pressure_psi, duration, system_state, smoke_triggered)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                datetime.utcnow().isoformat(),
-                int(fire_detected),
-                confidence,
-                distance_m,
-                pressure_bar,
-                pressure_psi,
-                duration,
-                system_state,
-                int(smoke_triggered),
-            ),
-        )
-        await conn.commit()
-        row_id = cursor.lastrowid or 0
-        logger.debug("Saved event id=%d state=%s", row_id, system_state)
-        return row_id
-    except Exception as exc:
-        logger.error("Failed to save event: %s", exc)
-        return 0
+# ---------------------------------------------------------------------------
+# writes
+# ---------------------------------------------------------------------------
 
 
-async def get_events(
-    limit: int = 50,
-    offset: int = 0,
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None,
-) -> List[Dict[str, Any]]:
-    """Query events with optional pagination and date filtering."""
-    conn = await _get_conn()
-    clauses: List[str] = []
-    params: List[Any] = []
-
-    if start_date:
-        clauses.append("timestamp >= ?")
-        params.append(start_date)
-    if end_date:
-        clauses.append("timestamp <= ?")
-        params.append(end_date)
-
-    where = ""
-    if clauses:
-        where = "WHERE " + " AND ".join(clauses)
-
-    query = f"""
-        SELECT * FROM events {where}
-        ORDER BY id DESC
-        LIMIT ? OFFSET ?
-    """
-    params.extend([limit, offset])
-
-    try:
-        cursor = await conn.execute(query, params)
-        rows = await cursor.fetchall()
-        return [_row_to_dict(r) for r in rows]
-    except Exception as exc:
-        logger.error("Failed to query events: %s", exc)
-        return []
+async def save_transition(ev: Dict[str, Any]) -> None:
+    await _db().execute(
+        "INSERT INTO transitions (timestamp, incident_id, from_state, to_state, note, confidence, smoke_ppm,"
+        " distance_m, pressure_bar) VALUES (?,?,?,?,?,?,?,?,?)",
+        (ev["at"], ev.get("incident_id"), ev["from"], ev["to"], ev.get("note"), ev.get("confidence"),
+         ev.get("smoke_ppm"), ev.get("distance_m"), ev.get("pressure_bar")),
+    )
+    await _db().commit()
 
 
-async def get_event_stats() -> Dict[str, Any]:
-    """Return aggregate statistics about stored events."""
-    conn = await _get_conn()
-    try:
-        cursor = await conn.execute("SELECT COUNT(*) AS total FROM events")
-        row = await cursor.fetchone()
-        total = row["total"] if row else 0
-
-        cursor = await conn.execute(
-            "SELECT COUNT(*) AS cnt FROM events WHERE fire_detected = 1"
-        )
-        row = await cursor.fetchone()
-        fire_count = row["cnt"] if row else 0
-
-        cursor = await conn.execute(
-            "SELECT COUNT(*) AS cnt FROM events WHERE smoke_triggered = 1"
-        )
-        row = await cursor.fetchone()
-        smoke_count = row["cnt"] if row else 0
-
-        cursor = await conn.execute(
-            "SELECT AVG(confidence) AS avg_conf FROM events WHERE fire_detected = 1"
-        )
-        row = await cursor.fetchone()
-        avg_conf = round(row["avg_conf"], 4) if row and row["avg_conf"] is not None else 0.0
-
-        cursor = await conn.execute(
-            "SELECT MAX(confidence) AS max_conf FROM events WHERE fire_detected = 1"
-        )
-        row = await cursor.fetchone()
-        max_conf = round(row["max_conf"], 4) if row and row["max_conf"] is not None else 0.0
-
-        cursor = await conn.execute(
-            "SELECT AVG(pressure_bar) AS avg_p FROM events WHERE pressure_bar IS NOT NULL"
-        )
-        row = await cursor.fetchone()
-        avg_pressure = round(row["avg_p"], 2) if row and row["avg_p"] is not None else None
-
-        return {
-            "total_events": total,
-            "fire_events": fire_count,
-            "smoke_events": smoke_count,
-            "avg_fire_confidence": avg_conf,
-            "max_fire_confidence": max_conf,
-            "avg_pressure_bar": avg_pressure,
-        }
-    except Exception as exc:
-        logger.error("Failed to compute stats: %s", exc)
-        return {
-            "total_events": 0,
-            "fire_events": 0,
-            "smoke_events": 0,
-            "avg_fire_confidence": 0.0,
-            "max_fire_confidence": 0.0,
-            "avg_pressure_bar": None,
-        }
+async def save_incident(rep: Dict[str, Any]) -> None:
+    m = rep["metrics"]
+    await _db().execute(
+        "INSERT OR REPLACE INTO incidents (id, started_at, ended_at, outcome, reason, duration_s, peak_confidence,"
+        " t_confirmed_s, t_suppression_s, t_extinguished_s, distance_m, pump_pressure_bar, flow_lpm, water_used_l,"
+        " metrics_json, timeline_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (rep["id"], rep["started_at"], rep["ended_at"], rep["outcome"], rep.get("reason"), rep["duration_s"],
+         m.get("peak_confidence"), m.get("t_confirmed_s"), m.get("t_suppression_s"), m.get("t_extinguished_s"),
+         m.get("distance_m"), m.get("pump_pressure_bar"), m.get("flow_lpm"), m.get("water_used_l"),
+         json.dumps(m), json.dumps(rep["timeline"])),
+    )
+    await _db().commit()
 
 
-async def export_events_csv() -> str:
-    """Export all events as a CSV string."""
-    conn = await _get_conn()
-    try:
-        cursor = await conn.execute("SELECT * FROM events ORDER BY id DESC")
-        rows = await cursor.fetchall()
-
-        output = io.StringIO()
-        writer = csv.writer(output)
-        writer.writerow([
-            "id", "timestamp", "fire_detected", "confidence",
-            "distance_m", "pressure_bar", "pressure_psi",
-            "duration", "system_state", "smoke_triggered",
-        ])
-        for r in rows:
-            writer.writerow([
-                r["id"], r["timestamp"], bool(r["fire_detected"]),
-                r["confidence"], r["distance_m"], r["pressure_bar"],
-                r["pressure_psi"], r["duration"], r["system_state"],
-                bool(r["smoke_triggered"]),
-            ])
-        return output.getvalue()
-    except Exception as exc:
-        logger.error("Failed to export CSV: %s", exc)
-        return ""
+# ---------------------------------------------------------------------------
+# reads
+# ---------------------------------------------------------------------------
 
 
-def _row_to_dict(row: aiosqlite.Row) -> Dict[str, Any]:
-    """Convert an aiosqlite Row to a plain dict with bools."""
-    d = dict(row)
-    d["fire_detected"] = bool(d.get("fire_detected", 0))
-    d["smoke_triggered"] = bool(d.get("smoke_triggered", 0))
+def _range(start: Optional[str], end: Optional[str], col: str) -> Tuple[str, List[Any]]:
+    clauses, params = [], []
+    if start:
+        clauses.append(f"{col} >= ?")
+        params.append(start)
+    if end:
+        clauses.append(f"{col} < ?")
+        params.append(end)
+    return ("WHERE " + " AND ".join(clauses)) if clauses else "", params
+
+
+async def get_transitions(limit: int, offset: int, start: Optional[str] = None,
+                          end: Optional[str] = None) -> Tuple[List[Dict[str, Any]], int]:
+    where, params = _range(start, end, "timestamp")
+    cur = await _db().execute(f"SELECT COUNT(*) FROM transitions {where}", params)
+    total = (await cur.fetchone())[0]
+    cur = await _db().execute(f"SELECT * FROM transitions {where} ORDER BY id DESC LIMIT ? OFFSET ?",
+                              [*params, limit, offset])
+    return [dict(r) for r in await cur.fetchall()], total
+
+
+def _incident_row(r: aiosqlite.Row) -> Dict[str, Any]:
+    d = dict(r)
+    d["metrics"] = json.loads(d.pop("metrics_json"))
+    d["timeline"] = json.loads(d.pop("timeline_json"))
     return d
+
+
+async def get_incidents(limit: int, offset: int, start: Optional[str] = None,
+                        end: Optional[str] = None) -> Tuple[List[Dict[str, Any]], int]:
+    where, params = _range(start, end, "started_at")
+    cur = await _db().execute(f"SELECT COUNT(*) FROM incidents {where}", params)
+    total = (await cur.fetchone())[0]
+    cur = await _db().execute(f"SELECT * FROM incidents {where} ORDER BY started_at DESC LIMIT ? OFFSET ?",
+                              [*params, limit, offset])
+    return [_incident_row(r) for r in await cur.fetchall()], total
+
+
+async def get_stats() -> Dict[str, Any]:
+    db = _db()
+    cur = await db.execute("SELECT outcome, COUNT(*) AS n FROM incidents GROUP BY outcome")
+    by_outcome = {r["outcome"]: r["n"] for r in await cur.fetchall()}
+    cur = await db.execute(
+        "SELECT AVG(t_confirmed_s) AS confirm, AVG(t_suppression_s) AS suppress, AVG(t_extinguished_s) AS extinguish,"
+        " AVG(pump_pressure_bar) AS pressure, AVG(distance_m) AS distance, SUM(water_used_l) AS water,"
+        " AVG(peak_confidence) AS conf FROM incidents WHERE outcome = 'EXTINGUISHED'")
+    r = await cur.fetchone()
+    cur = await db.execute("SELECT COUNT(*) FROM transitions")
+    transitions = (await cur.fetchone())[0]
+
+    def rnd(v: Any, n: int = 2) -> Optional[float]:
+        return round(v, n) if v is not None else None
+
+    return {
+        "total_incidents": sum(by_outcome.values()),
+        "by_outcome": by_outcome,
+        "extinguished": by_outcome.get("EXTINGUISHED", 0),
+        "false_alarms_rejected": by_outcome.get("FALSE_ALARM_REJECTED", 0),
+        "operator_alerts": by_outcome.get("VISION_ONLY_ALERT", 0) + by_outcome.get("SMOKE_ONLY_ALERT", 0),
+        "escalated": by_outcome.get("ESCALATED", 0),
+        "avg_time_to_confirm_s": rnd(r["confirm"]),
+        "avg_time_to_suppression_s": rnd(r["suppress"]),
+        "avg_time_to_extinguish_s": rnd(r["extinguish"]),
+        "avg_pump_pressure_bar": rnd(r["pressure"]),
+        "avg_distance_m": rnd(r["distance"]),
+        "total_water_l": rnd(r["water"]),
+        "avg_peak_confidence": rnd(r["conf"], 3),
+        "transitions": transitions,
+    }
+
+
+async def export_csv() -> str:
+    cur = await _db().execute("SELECT * FROM incidents ORDER BY started_at DESC")
+    rows = await cur.fetchall()
+    out = io.StringIO()
+    cols = ["id", "started_at", "ended_at", "outcome", "reason", "duration_s", "peak_confidence", "t_confirmed_s",
+            "t_suppression_s", "t_extinguished_s", "distance_m", "pump_pressure_bar", "flow_lpm", "water_used_l"]
+    w = csv.writer(out)
+    w.writerow(cols)
+    for r in rows:
+        w.writerow([r[c] for c in cols])
+    return out.getvalue()

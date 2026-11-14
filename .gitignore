@@ -37,3 +37,9 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+# FireGuard runtime data
+*.db
+backend/runtime_settings.json
+# demo media and model weights are large - see README "Demo assets"
+backend/media/*.mp4
+backend/models/*.pt

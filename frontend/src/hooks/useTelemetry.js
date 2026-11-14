@@ -1,81 +1,64 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import useWebSocket from './useWebSocket';
 
-const MAX_HISTORY = 200;
+const MAX_HISTORY = 240; // 60 s at 4 Hz
 const MAX_FRAMES = 50;
 
 export default function useTelemetry() {
-  const { telemetry: rawTelemetry, isConnected, reconnectAttempts, error } = useWebSocket();
+  const { telemetry: t, isConnected, reconnectAttempts, error } = useWebSocket();
   const [telemetryHistory, setTelemetryHistory] = useState([]);
   const [frameRecords, setFrameRecords] = useState([]);
-  const [latestTelemetry, setLatestTelemetry] = useState(null);
   const lastFrameIdRef = useRef(null);
 
   useEffect(() => {
-    if (!rawTelemetry) return;
+    if (!t) return;
+    const sup = t.pipeline?.suppression ?? {};
+    setTelemetryHistory((prev) => {
+      const next = [...prev, {
+        timestamp: t.timestamp,
+        confidence: t.confidence,
+        fire_detected: t.fire_detected,
+        distance_m: t.sensors?.lidar?.distance_m ?? null,
+        smoke_ppm: t.sensors?.smoke?.ppm ?? null,
+        smoke_threshold: t.sensors?.smoke?.threshold_ppm ?? null,
+        estimated_pressure_bar: t.estimated_pressure_bar,
+        estimated_pressure_psi: t.estimated_pressure_psi,
+        pump_bar: sup.pump_pressure_bar ?? 0,
+        flow_lpm: sup.flow_lpm ?? 0,
+        intensity: t.scene?.intensity ?? null,
+        system_state: t.system_state,
+      }];
+      return next.length > MAX_HISTORY ? next.slice(-MAX_HISTORY) : next;
+    });
 
-    setLatestTelemetry(rawTelemetry);
-
-    if (rawTelemetry.frame_id !== lastFrameIdRef.current) {
-      lastFrameIdRef.current = rawTelemetry.frame_id;
-
-      setTelemetryHistory(prev => {
+    if (t.frame_id !== lastFrameIdRef.current) {
+      lastFrameIdRef.current = t.frame_id;
+      setFrameRecords((prev) => {
         const next = [...prev, {
-          timestamp: rawTelemetry.timestamp,
-          confidence: rawTelemetry.confidence,
-          fire_detected: rawTelemetry.fire_detected,
-          distance_m: rawTelemetry.distance_m,
-          estimated_pressure_bar: rawTelemetry.estimated_pressure_bar,
-          estimated_pressure_psi: rawTelemetry.estimated_pressure_psi,
-          system_state: rawTelemetry.system_state,
+          frame_id: t.frame_id,
+          timestamp: t.timestamp,
+          fire_detected: t.fire_detected,
+          confidence: t.confidence,
+          smoke_triggered: t.smoke_triggered,
+          distance_m: t.distance_m,
+          estimated_pressure_bar: t.estimated_pressure_bar,
+          system_decision: t.system_state,
         }];
-        return next.length > MAX_HISTORY ? next.slice(-MAX_HISTORY) : next;
-      });
-
-      setFrameRecords(prev => {
-        const record = {
-          frame_id: rawTelemetry.frame_id,
-          timestamp: rawTelemetry.timestamp,
-          fire_detected: rawTelemetry.fire_detected,
-          confidence: rawTelemetry.confidence,
-          smoke_triggered: rawTelemetry.smoke_triggered,
-          distance_m: rawTelemetry.distance_m,
-          estimated_pressure_bar: rawTelemetry.estimated_pressure_bar,
-          system_decision: rawTelemetry.system_state,
-        };
-        const next = [...prev, record];
         return next.length > MAX_FRAMES ? next.slice(-MAX_FRAMES) : next;
       });
     }
-  }, [rawTelemetry]);
-
-  const fireDetectionHistory = telemetryHistory.map(t => ({
-    timestamp: t.timestamp,
-    confidence: t.confidence,
-    fire_detected: t.fire_detected,
-  }));
-
-  const distanceHistory = telemetryHistory.map(t => ({
-    timestamp: t.timestamp,
-    distance_m: t.distance_m,
-  }));
-
-  const pressureHistory = telemetryHistory.map(t => ({
-    timestamp: t.timestamp,
-    estimated_pressure_bar: t.estimated_pressure_bar,
-  }));
+  }, [t]);
 
   return {
-    latestTelemetry,
+    latestTelemetry: t,
     telemetryHistory,
     frameRecords,
-    fireDetectionHistory,
-    distanceHistory,
-    pressureHistory,
+    fireDetectionHistory: telemetryHistory.map(({ timestamp, confidence, fire_detected }) => ({ timestamp, confidence, fire_detected })),
+    distanceHistory: telemetryHistory.map(({ timestamp, distance_m }) => ({ timestamp, distance_m })),
+    pressureHistory: telemetryHistory.map(({ timestamp, estimated_pressure_bar, pump_bar }) => ({ timestamp, estimated_pressure_bar, pump_bar })),
     isConnected,
     reconnectAttempts,
     error,
-    demoMode: latestTelemetry?.demo_mode || false,
+    demoMode: t?.demo_mode || false,
   };
 }
-

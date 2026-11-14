@@ -1,407 +1,503 @@
 """
-FireGuard AI - FastAPI Application Entry Point
+FireGuard AI - FastAPI application.
 
-Creates the FastAPI app, registers all routes / WebSocket endpoints, and
-manages the background telemetry loop.
+Three background loops:
+  * detection_loop  - latest camera frame -> YOLOv8 -> pipeline.on_frame()        (~12 fps)
+  * telemetry_loop  - scene physics, sensors -> pipeline.on_tick(), WebSocket push (4 Hz)
+  * display_loop    - annotated camera view encoded as JPEG for the MJPEG stream   (~25 fps)
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
+import cv2
+import numpy as np
+from fastapi import Body, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
+from pydantic import ValidationError
 
-from app.camera import CameraManager
-from app.config import settings
-from app.database import close_db, export_events_csv, get_event_stats, get_events, init_db, save_event
+from app import database as db
+from app import overlay
+from app.config import apply_updates, editable_values, save_runtime_overrides, settings
 from app.detection import DetectionEngine
-from app.hardware import HardwareManager
-from app.logic import SystemLogic
-from app.schemas import PressureParams, SystemSettings, TelemetryData
+from app.hardware import ArduinoSensors
+from app.pipeline import Pipeline, SensorReading
+from app.schemas import ScenarioAction
+from app.simulation import FireScene, LidarSim, SmokeSensorSim
+from app.video import StreamPlayer, placeholder_frame
 from app.websocket import ConnectionManager
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(name)-24s  %(levelname)-7s  %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(name)-22s  %(levelname)-7s  %(message)s")
 logger = logging.getLogger("fireguard.main")
 
+
+class Runtime:
+    """All live objects of the running system."""
+
+    def __init__(self) -> None:
+        self.engine = DetectionEngine()
+        self.pipeline = Pipeline(settings)
+        self.scene = FireScene(settings.path(settings.MEDIA_DIR), settings.SIM_FIRE_DISTANCE_M)
+        self.stream: Optional[StreamPlayer] = None
+        self.smoke = SmokeSensorSim()
+        self.lidar = LidarSim()
+        self.arduino: Optional[ArduinoSensors] = None
+        self.ws = ConnectionManager()
+        self.detections: list = []
+        self.frame_no = 0
+        self.det_times: list[float] = []
+        self.jpeg: Optional[bytes] = None
+        self.sensor_status: Dict[str, Any] = {}
+        self.reading: Optional[SensorReading] = None
+        self.tasks: list[asyncio.Task] = []
+        self.running = False
+
+    # ---- sources ------------------------------------------------------------
+    def start_source(self) -> None:
+        self.stop_source()
+        if settings.CAMERA_SOURCE == "scenario":
+            self.scene.start()
+        else:
+            src: Any = settings.WEBCAM_INDEX if settings.CAMERA_SOURCE == "webcam" else settings.CAMERA_URL
+            self.stream = StreamPlayer(src)
+            self.stream.start()
+
+    def stop_source(self) -> None:
+        self.scene.stop()
+        if self.stream is not None:
+            self.stream.stop()
+            self.stream = None
+
+    def camera_frame(self) -> Optional[np.ndarray]:
+        if settings.CAMERA_SOURCE == "scenario":
+            return self.scene.camera_frame()
+        return self.stream.latest() if self.stream else None
+
+    @property
+    def camera_connected(self) -> bool:
+        if settings.CAMERA_SOURCE == "scenario":
+            return self.scene.video_connected
+        return bool(self.stream and self.stream.connected)
+
+    @property
+    def video_fps(self) -> float:
+        if settings.CAMERA_SOURCE == "scenario":
+            return self.scene.status()["video_fps"]
+        return round(self.stream.fps, 1) if self.stream else 0.0
+
+    @property
+    def detection_fps(self) -> float:
+        t = self.det_times
+        return round((len(t) - 1) / (t[-1] - t[0]), 1) if len(t) > 1 and t[-1] > t[0] else 0.0
+
+    def start_sensors(self) -> None:
+        self.stop_sensors()
+        self.smoke.reset()
+        self.lidar.reset()
+        if not settings.DEMO_MODE:
+            self.arduino = ArduinoSensors(settings.ARDUINO_PORT, settings.BAUD_RATE)
+            self.arduino.start()
+
+    def stop_sensors(self) -> None:
+        if self.arduino is not None:
+            self.arduino.stop()
+            self.arduino = None
+
+
+rt = Runtime()
+
+
 # ---------------------------------------------------------------------------
-# Shared service instances
+# loops
 # ---------------------------------------------------------------------------
 
-camera_manager = CameraManager()
-detection_engine = DetectionEngine()
-hardware_manager = HardwareManager()
-system_logic = SystemLogic()
-ws_manager = ConnectionManager()
 
-# Global mutable state
-_latest_telemetry: Dict[str, Any] = {}
-_telemetry_task: Optional[asyncio.Task] = None
-_running: bool = False
-_previous_state: str = "MONITORING"
+async def persist_events() -> None:
+    for ev in rt.pipeline.drain_events():
+        try:
+            if ev["type"] == "transition":
+                await db.save_transition(ev)
+            else:
+                await db.save_incident(ev["incident"])
+        except Exception as exc:
+            logger.error("Failed to store %s: %s", ev["type"], exc)
+
+
+async def detection_loop() -> None:
+    while rt.running:
+        t0 = time.perf_counter()
+        try:
+            frame = rt.camera_frame()
+            if frame is None:
+                await asyncio.sleep(0.1)
+                continue
+            dets = await rt.engine.detect(frame)
+            now = time.time()
+            rt.detections = dets
+            rt.frame_no += 1
+            rt.det_times = [t for t in rt.det_times if now - t < 3.0] + [now]
+            rt.pipeline.on_frame(dets, frame.shape[1], frame.shape[0], now)
+            await persist_events()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("Detection loop error: %s", exc, exc_info=True)
+            await asyncio.sleep(0.5)
+        spare = 1.0 / settings.DETECTION_MAX_FPS - (time.perf_counter() - t0)
+        await asyncio.sleep(max(0.0, spare))
+
+
+def read_sensors(now: float, dt: float) -> SensorReading:
+    if settings.DEMO_MODE:
+        src = rt.scene.smoke_source_ppm(now, settings.SMOKE_MAX_PPM)
+        s = rt.smoke.update(now, dt, src, settings.SMOKE_TRANSPORT_DELAY_S, settings.SMOKE_RISE_TAU_S,
+                            settings.SMOKE_THRESHOLD_PPM, settings.SMOKE_HYSTERESIS_PPM)
+        target = rt.scene.lidar_target_m(rt.pipeline.aimed_at_fire)
+        ls = rt.lidar.update(now, dt, target, s["ppm"])
+        rt.sensor_status = {
+            "smoke": {**s, "online": True, "simulated": True},
+            "lidar": {"distance_m": ls.distance_m, "valid": ls.valid, "strength": ls.strength,
+                      "aimed_at_fire": rt.pipeline.aimed_at_fire, "online": True, "simulated": True},
+        }
+        return SensorReading(s["ppm"], s["triggered"], s["adc"], ls.distance_m, ls.valid, ls.strength)
+    r = rt.arduino.reading() if rt.arduino else SensorReading(None, False, None, None, False, None, online=False)
+    rt.sensor_status = {
+        "smoke": {"ppm": r.smoke_ppm, "adc": r.smoke_adc, "triggered": r.smoke_triggered,
+                  "threshold_ppm": settings.SMOKE_THRESHOLD_PPM, "online": r.online, "simulated": False},
+        "lidar": {"distance_m": r.lidar_distance_m, "valid": r.lidar_valid, "strength": r.lidar_strength,
+                  "aimed_at_fire": rt.pipeline.aimed_at_fire, "online": r.online, "simulated": False},
+    }
+    return r
+
+
+def build_telemetry(now: float) -> Dict[str, Any]:
+    p = rt.pipeline
+    snap = p.snapshot(now, rt.detection_fps)
+    fire = [d for d in rt.detections if d.get("kind") == "fire"]
+    smoke_v = [d for d in rt.detections if d.get("kind") == "smoke"]
+    best = max((d["conf"] for d in fire), default=0.0)
+    h = p.hydraulics
+    r = rt.reading
+    return {
+        # summary fields (used across the dashboard)
+        "frame_id": rt.frame_no,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "fire_detected": p.last_positive,
+        "confidence": round(best, 4),
+        "visual_smoke_confidence": round(max((d["conf"] for d in smoke_v), default=0.0), 4),
+        "smoke_triggered": bool(r and r.smoke_triggered),
+        "smoke_ppm": r.smoke_ppm if r else None,
+        "distance_m": (p.distance or {}).get("median_m") or (r.lidar_distance_m if r else None),
+        "estimated_pressure_bar": h["pump_pressure_bar"] if h and h.get("reachable") else None,
+        "estimated_pressure_psi": h["pump_pressure_psi"] if h and h.get("reachable") else None,
+        "system_state": p.state.value,
+        "bounding_boxes": rt.detections,
+        "fps": rt.video_fps,
+        "detection_fps": rt.detection_fps,
+        "inference_ms": round(rt.engine.last_inference_ms, 1),
+        "camera_connected": rt.camera_connected,
+        "camera_source": settings.CAMERA_SOURCE,
+        "arduino_connected": bool(rt.arduino and rt.arduino.connected),
+        "smoke_sensor_connected": bool(rt.sensor_status.get("smoke", {}).get("online")),
+        "lidar_connected": bool(rt.sensor_status.get("lidar", {}).get("online")),
+        "demo_mode": settings.DEMO_MODE,
+        "detector": {
+            "mode": rt.engine.mode, "model_path": rt.engine.model_path, "classes": rt.engine.class_names,
+            "threshold": settings.CONFIDENCE_THRESHOLD, "load_error": rt.engine.load_error,
+            "imgsz": settings.YOLO_IMGSZ, "threads": rt.engine.threads,
+        },
+        "sensors": rt.sensor_status,
+        "pipeline": snap,
+        "scene": rt.scene.status() if settings.CAMERA_SOURCE == "scenario" else None,
+    }
+
+
+async def telemetry_loop() -> None:
+    last = time.time()
+    while rt.running:
+        try:
+            now = time.time()
+            dt = max(1e-3, now - last)
+            last = now
+            p = rt.pipeline
+            rt.scene.apply_water(p.flow_lpm, p.required_flow_lpm, p.pressure_ratio)
+            rt.scene.tick(now, dt, settings.KNOCKDOWN_REF_S)
+            rt.reading = read_sensors(now, dt)
+            p.on_tick(rt.reading, now, dt)
+            await persist_events()
+            await rt.ws.broadcast(build_telemetry(now))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("Telemetry loop error: %s", exc, exc_info=True)
+        await asyncio.sleep(settings.WS_BROADCAST_INTERVAL)
+
+
+def _render_jpeg(frame: Optional[np.ndarray], snap: Dict[str, Any], dets: list, lidar: Optional[float],
+                 inference_ms: float, frame_no: int) -> Optional[bytes]:
+    if frame is None:
+        frame = placeholder_frame("No video")
+    img = overlay.render(frame, dets, snap, settings.CONFIDENCE_THRESHOLD, inference_ms, frame_no,
+                         settings.CAMERA_SOURCE == "scenario", lidar)
+    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    return buf.tobytes() if ok else None
+
+
+async def display_loop() -> None:
+    loop = asyncio.get_running_loop()
+    while rt.running:
+        try:
+            if rt.ws.get_connection_count() > 0 or _stream_clients > 0:
+                # snapshot state on the event loop; only pixel work runs in the worker thread
+                args = (rt.camera_frame(), rt.pipeline.snapshot(time.time(), rt.detection_fps), rt.detections,
+                        rt.sensor_status.get("lidar", {}).get("distance_m"), rt.engine.last_inference_ms,
+                        rt.frame_no)
+                rt.jpeg = await loop.run_in_executor(None, _render_jpeg, *args)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("Display loop error: %s", exc)
+        await asyncio.sleep(0.05)
+
+
+_stream_clients = 0
 
 
 # ---------------------------------------------------------------------------
-# Lifespan
+# app
 # ---------------------------------------------------------------------------
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup and shutdown hooks."""
-    global _telemetry_task, _running
-
-    # ---- Startup ----
-    logger.info("Starting FireGuard AI Backend (DEMO_MODE=%s)", settings.DEMO_MODE)
-    await init_db()
-    await camera_manager.connect()
-    await detection_engine.load_model()
-    await hardware_manager.connect_arduino()
-
-    _running = True
-    _telemetry_task = asyncio.create_task(telemetry_loop())
-    logger.info("Telemetry loop started.")
-
+    logger.info("Starting FireGuard AI (source=%s, simulated sensors=%s)", settings.CAMERA_SOURCE, settings.DEMO_MODE)
+    await db.init_db()
+    await rt.engine.load_model()
+    rt.start_source()
+    rt.start_sensors()
+    rt.running = True
+    rt.tasks = [asyncio.create_task(f()) for f in (detection_loop, telemetry_loop, display_loop)]
     yield
-
-    # ---- Shutdown ----
-    _running = False
-    if _telemetry_task is not None:
-        _telemetry_task.cancel()
-        try:
-            await _telemetry_task
-        except asyncio.CancelledError:
-            pass
-    await camera_manager.disconnect()
-    await hardware_manager.disconnect_arduino()
-    await close_db()
-    logger.info("FireGuard AI Backend shut down.")
+    rt.running = False
+    for t in rt.tasks:
+        t.cancel()
+    await asyncio.gather(*rt.tasks, return_exceptions=True)
+    rt.stop_source()
+    rt.stop_sensors()
+    await db.close_db()
+    logger.info("FireGuard AI stopped.")
 
 
-app = FastAPI(
-    title="FireGuard AI Backend",
-    description="Real-time AI fire detection and suppression estimation dashboard backend.",
-    version="1.0.0",
-    lifespan=lifespan,
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ---------------------------------------------------------------------------
-# Background telemetry loop
-# ---------------------------------------------------------------------------
-
-
-async def telemetry_loop() -> None:
-    """Continuously capture → detect → read sensors → decide → broadcast."""
-    global _latest_telemetry, _previous_state
-
-    frame_id = 0
-    while _running:
-        try:
-            # 1. Capture frame
-            frame = await camera_manager.get_frame()
-
-            # 2. Run YOLO detection
-            detections = []
-            if frame is not None:
-                detections = await detection_engine.detect(frame)
-
-            fire_detected = any(d["conf"] >= settings.CONFIDENCE_THRESHOLD for d in detections) if detections else False
-            max_confidence = max((d["conf"] for d in detections), default=0.0)
-
-            # 3. Read hardware sensors
-            smoke_triggered, distance_m = await hardware_manager.read_sensors(
-                fire_detected=fire_detected
-            )
-
-            # 4. Process through logic engine
-            system_state = system_logic.process_inputs(
-                fire_detected=fire_detected,
-                confidence=max_confidence,
-                smoke_triggered=smoke_triggered,
-                distance_m=distance_m,
-            )
-
-            # 5. Calculate pressure if distance available
-            pressure_bar: Optional[float] = None
-            pressure_psi: Optional[float] = None
-            if distance_m is not None and distance_m > 0:
-                pressure_bar, pressure_psi = system_logic.calculate_pressure(distance_m)
-
-            # Annotate frame for MJPEG stream
-            if frame is not None:
-                bboxes = [
-                    {
-                        "x1": d["x1"], "y1": d["y1"],
-                        "x2": d["x2"], "y2": d["y2"],
-                        "conf": d["conf"], "label": d["label"],
-                    }
-                    for d in detections
-                ]
-                await camera_manager.get_processed_frame(detections=bboxes)
-
-            # 6. Build TelemetryData
-            frame_id += 1
-            telemetry = TelemetryData(
-                frame_id=frame_id,
-                timestamp=datetime.utcnow().isoformat(),
-                fire_detected=fire_detected,
-                confidence=round(max_confidence, 4),
-                smoke_triggered=smoke_triggered,
-                distance_m=distance_m,
-                estimated_pressure_bar=pressure_bar,
-                estimated_pressure_psi=pressure_psi,
-                system_state=system_state,
-                bounding_boxes=[
-                    {
-                        "x1": d["x1"], "y1": d["y1"],
-                        "x2": d["x2"], "y2": d["y2"],
-                        "conf": d["conf"], "label": d["label"],
-                    }
-                    for d in detections
-                ],
-                fps=camera_manager.fps,
-                camera_connected=camera_manager.is_connected,
-                arduino_connected=hardware_manager.arduino_connected,
-                smoke_sensor_connected=hardware_manager.smoke_sensor_status["connected"],
-                lidar_connected=hardware_manager.lidar_status["connected"],
-                demo_mode=settings.DEMO_MODE,
-            )
-
-            _latest_telemetry = telemetry.model_dump()
-
-            # 7. Broadcast via WebSocket
-            await ws_manager.broadcast(_latest_telemetry)
-
-            # 8. Save significant events to database
-            state_changed = system_state != _previous_state
-            if fire_detected or state_changed:
-                await save_event(
-                    fire_detected=fire_detected,
-                    confidence=max_confidence,
-                    distance_m=distance_m,
-                    pressure_bar=pressure_bar,
-                    pressure_psi=pressure_psi,
-                    duration=system_logic.fire_duration,
-                    system_state=system_state,
-                    smoke_triggered=smoke_triggered,
-                )
-            _previous_state = system_state
-
-            # 9. Sleep for broadcast interval
-            await asyncio.sleep(settings.WS_BROADCAST_INTERVAL)
-
-        except asyncio.CancelledError:
-            break
-        except Exception as exc:
-            logger.error("Telemetry loop error: %s", exc, exc_info=True)
-            await asyncio.sleep(1.0)
-
-
-# ---------------------------------------------------------------------------
-# REST API Endpoints
-# ---------------------------------------------------------------------------
+app = FastAPI(title="FireGuard AI Backend", version="2.0.0", lifespan=lifespan,
+              description="YOLOv8 fire detection -> temporal validation -> sensor fusion -> "
+                          "LiDAR distance -> hydraulic pressure estimation -> suppression.")
+app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origins, allow_credentials=False,
+                   allow_methods=["GET", "POST"], allow_headers=["Content-Type"])
 
 
 @app.get("/", tags=["Health"])
-async def health_check() -> Dict[str, Any]:
-    """Health check / root endpoint."""
-    return {
-        "status": "ok",
-        "service": "FireGuard AI Backend",
-        "demo_mode": settings.DEMO_MODE,
-        "timestamp": datetime.utcnow().isoformat(),
-    }
+async def health() -> Dict[str, Any]:
+    return {"status": "ok", "service": "FireGuard AI", "timestamp": datetime.now(timezone.utc).isoformat()}
 
 
 @app.get("/api/status", tags=["Status"])
-async def system_status() -> Dict[str, Any]:
-    """Current system status summary."""
+async def status() -> Dict[str, Any]:
     return {
-        "system_state": system_logic.current_state,
-        "suppression": system_logic.get_suppression_timeline(),
-        "camera_connected": camera_manager.is_connected,
-        "arduino_connected": hardware_manager.arduino_connected,
+        "system_state": rt.pipeline.state.value,
+        "camera_source": settings.CAMERA_SOURCE,
+        "camera_connected": rt.camera_connected,
         "demo_mode": settings.DEMO_MODE,
-        "ws_connections": ws_manager.get_connection_count(),
-        "frames_processed": camera_manager.frame_count,
-        "fps": camera_manager.fps,
-        "model_loaded": detection_engine.model_loaded,
-        "timestamp": datetime.utcnow().isoformat(),
+        "model_loaded": rt.engine.model_loaded,
+        "detector_mode": rt.engine.mode,
+        "detection_fps": rt.detection_fps,
+        "ws_connections": rt.ws.get_connection_count(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
 @app.get("/api/telemetry/latest", tags=["Telemetry"])
 async def latest_telemetry() -> Dict[str, Any]:
-    """Return the most recent telemetry reading."""
-    if _latest_telemetry:
-        return _latest_telemetry
-    return {"message": "No telemetry available yet."}
+    return build_telemetry(time.time())
 
 
-@app.get("/api/events", tags=["Events"])
-async def list_events(
-    limit: int = Query(50, ge=1, le=500),
-    offset: int = Query(0, ge=0),
-    start_date: Optional[str] = Query(None, description="ISO-8601 start date filter"),
-    end_date: Optional[str] = Query(None, description="ISO-8601 end date filter"),
-) -> Dict[str, Any]:
-    """Paginated event history."""
-    events = await get_events(limit=limit, offset=offset, start_date=start_date, end_date=end_date)
-    return {"events": events, "count": len(events), "limit": limit, "offset": offset}
+# ---- scenario (presenter controls) ------------------------------------------
 
 
-@app.get("/api/events/stats", tags=["Events"])
-async def event_stats() -> Dict[str, Any]:
-    """Aggregate event statistics."""
-    return await get_event_stats()
+@app.get("/api/scenario", tags=["Scenario"])
+async def get_scenario() -> Dict[str, Any]:
+    return {"scene": rt.scene.status(), "clips": rt.scene.clips, "camera_source": settings.CAMERA_SOURCE}
 
 
-@app.get("/api/events/export/csv", tags=["Events"])
+@app.post("/api/scenario", tags=["Scenario"])
+async def scenario_action(body: ScenarioAction) -> Dict[str, Any]:
+    now = time.time()
+    s = rt.scene
+    if body.action == "ignite":
+        if body.fire_clip:
+            s.select_clips(None, body.fire_clip)
+        s.ignite(now)
+    elif body.action == "false_alarm":
+        s.false_alarm(now, body.duration_s or 0.5)
+    elif body.action == "inject_smoke":
+        s.inject_smoke(now, body.duration_s or 10.0)
+    elif body.action == "set_distance":
+        if body.distance_m is None:
+            raise HTTPException(422, "distance_m required")
+        s.distance_m = body.distance_m
+    elif body.action == "select_clips":
+        s.select_clips(body.normal_clip, body.fire_clip)
+    elif body.action in ("pause", "resume"):
+        s.set_paused(body.action == "pause")
+    elif body.action == "reset":
+        s.reset()
+        rt.smoke.reset()
+        rt.lidar.reset()
+        rt.pipeline.reset(now)
+        await persist_events()
+    logger.info("Scenario action: %s", body.action)
+    return {"scene": s.status()}
+
+
+@app.post("/api/pipeline/reset", tags=["Scenario"])
+async def pipeline_reset() -> Dict[str, Any]:
+    rt.pipeline.reset(time.time())
+    await persist_events()
+    return {"state": rt.pipeline.state.value}
+
+
+# ---- history ----------------------------------------------------------------
+
+
+@app.get("/api/incidents", tags=["History"])
+async def incidents(limit: int = Query(20, ge=1, le=200), offset: int = Query(0, ge=0),
+                    start_date: Optional[str] = None, end_date: Optional[str] = None) -> Dict[str, Any]:
+    rows, total = await db.get_incidents(limit, offset, start_date, end_date)
+    return {"incidents": rows, "total": total, "limit": limit, "offset": offset}
+
+
+@app.get("/api/events", tags=["History"])
+async def events(limit: int = Query(50, ge=1, le=500), offset: int = Query(0, ge=0),
+                 start_date: Optional[str] = None, end_date: Optional[str] = None) -> Dict[str, Any]:
+    rows, total = await db.get_transitions(limit, offset, start_date, end_date)
+    return {"events": rows, "total": total, "limit": limit, "offset": offset}
+
+
+@app.get("/api/events/stats", tags=["History"])
+async def stats() -> Dict[str, Any]:
+    return await db.get_stats()
+
+
+@app.get("/api/events/export/csv", tags=["History"])
 async def export_csv() -> Response:
-    """Export all events as a downloadable CSV file."""
-    csv_data = await export_events_csv()
-    return Response(
-        content=csv_data,
-        media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=fireguard_events.csv"},
-    )
+    return Response(content=await db.export_csv(), media_type="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=fireguard_incidents.csv"})
+
+
+# ---- settings ---------------------------------------------------------------
+
+_CRED = re.compile(r"(//[^:/@]+:)([^@]+)@")
+
+
+def _mask(url: str) -> str:
+    return _CRED.sub(r"\1****@", url)
+
+
+def settings_payload() -> Dict[str, Any]:
+    values = editable_values(settings)
+    values["CAMERA_URL"] = _mask(values["CAMERA_URL"])
+    models = sorted(str(p.relative_to(settings.path("."))).replace("\\", "/")
+                    for p in settings.path(settings.MODELS_DIR).glob("*.pt"))
+    return {"values": values, "models": models, "detector": {"mode": rt.engine.mode, "classes": rt.engine.class_names,
+                                                             "load_error": rt.engine.load_error}}
 
 
 @app.get("/api/settings", tags=["Settings"])
 async def get_settings() -> Dict[str, Any]:
-    """Return current system settings."""
-    return {
-        "camera_url": settings.CAMERA_URL,
-        "model_path": settings.YOLO_MODEL_PATH,
-        "confidence_threshold": settings.CONFIDENCE_THRESHOLD,
-        "arduino_port": settings.ARDUINO_PORT,
-        "baud_rate": settings.BAUD_RATE,
-        "demo_mode": settings.DEMO_MODE,
-        "ws_broadcast_interval": settings.WS_BROADCAST_INTERVAL,
-        "pressure_params": {
-            "base": settings.PRESSURE_BASE,
-            "factor": settings.PRESSURE_FACTOR,
-            "min_pressure": settings.MIN_PRESSURE,
-            "max_pressure": settings.MAX_PRESSURE,
-        },
-    }
+    return settings_payload()
 
 
 @app.post("/api/settings", tags=["Settings"])
-async def update_settings(body: SystemSettings) -> Dict[str, Any]:
-    """Update mutable system settings at runtime.
+async def update_settings(updates: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    if "CAMERA_URL" in updates and "****" in str(updates["CAMERA_URL"]):
+        updates.pop("CAMERA_URL")  # masked value sent back unchanged
+    updates = {k: v for k, v in updates.items() if getattr(settings, k, object()) != v}
+    if "YOLO_MODEL_PATH" in updates:
+        try:
+            DetectionEngine.resolve_model_path(updates["YOLO_MODEL_PATH"])
+        except ValueError as exc:
+            raise HTTPException(422, str(exc))
+    try:
+        applied = apply_updates(settings, updates)
+    except ValidationError as exc:
+        raise HTTPException(422, "; ".join(f"{'.'.join(map(str, e['loc']))}: {e['msg']}" for e in exc.errors()))
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    save_runtime_overrides(settings)
+    keys = set(applied)
+    if keys & {"CAMERA_SOURCE", "CAMERA_URL", "WEBCAM_INDEX"}:
+        rt.start_source()
+    if keys & {"YOLO_MODEL_PATH"}:
+        await rt.engine.load_model(settings.YOLO_MODEL_PATH)
+    if keys & {"DEMO_MODE", "ARDUINO_PORT", "BAUD_RATE"}:
+        rt.start_sensors()
+    if keys & {"TEMPORAL_WINDOW", "TEMPORAL_MIN_POSITIVE", "TEMPORAL_MIN_IOU"}:
+        rt.pipeline.reconfigure()
+    logger.info("Settings updated: %s", ", ".join(sorted(keys)) or "(no changes)")
+    return {"applied": sorted(keys), **settings_payload()}
 
-    Only fields that are provided (not None) are updated.
-    """
-    if body.camera_url is not None:
-        settings.CAMERA_URL = body.camera_url
-    if body.model_path is not None:
-        settings.YOLO_MODEL_PATH = body.model_path
-        await detection_engine.load_model(body.model_path)
-    if body.confidence_threshold is not None:
-        settings.CONFIDENCE_THRESHOLD = body.confidence_threshold
-        detection_engine.confidence_threshold = body.confidence_threshold
-    if body.arduino_port is not None:
-        settings.ARDUINO_PORT = body.arduino_port
-    if body.baud_rate is not None:
-        settings.BAUD_RATE = body.baud_rate
-    if body.pressure_params is not None:
-        pp: PressureParams = body.pressure_params
-        if pp.base is not None:
-            settings.PRESSURE_BASE = pp.base
-        if pp.factor is not None:
-            settings.PRESSURE_FACTOR = pp.factor
-        if pp.min_pressure is not None:
-            settings.MIN_PRESSURE = pp.min_pressure
-        if pp.max_pressure is not None:
-            settings.MAX_PRESSURE = pp.max_pressure
 
-    logger.info("Settings updated via API.")
-    return {"status": "updated", "settings": await get_settings()}
+@app.post("/api/demo/toggle", tags=["Settings"])
+async def toggle_demo() -> Dict[str, Any]:
+    apply_updates(settings, {"DEMO_MODE": not settings.DEMO_MODE})
+    save_runtime_overrides(settings)
+    rt.start_sensors()
+    return {"demo_mode": settings.DEMO_MODE}
 
 
 @app.get("/api/sensors", tags=["Sensors"])
-async def sensor_statuses() -> Dict[str, Any]:
-    """Return the status of every sensor."""
-    return {
-        "sensors": [
-            {
-                "name": "IP Camera",
-                "connected": camera_manager.is_connected or settings.DEMO_MODE,
-                "last_reading": f"{camera_manager.frame_count} frames",
-                "last_update": datetime.utcnow().isoformat(),
-            },
-            hardware_manager.smoke_sensor_status,
-            hardware_manager.lidar_status,
-            {
-                "name": "YOLO Model",
-                "connected": detection_engine.model_loaded or settings.DEMO_MODE,
-                "last_reading": detection_engine.model_path,
-                "last_update": datetime.utcnow().isoformat(),
-            },
-        ],
-        "demo_mode": settings.DEMO_MODE,
-    }
+async def sensors() -> Dict[str, Any]:
+    return {"sensors": rt.sensor_status, "camera_connected": rt.camera_connected, "demo_mode": settings.DEMO_MODE}
+
+
+# ---- streams ----------------------------------------------------------------
 
 
 @app.get("/api/stream/camera", tags=["Stream"])
 async def camera_stream() -> StreamingResponse:
-    """MJPEG camera stream for use in ``<img src="...">``."""
-    return StreamingResponse(
-        camera_manager.generate_mjpeg_stream(),
-        media_type="multipart/x-mixed-replace; boundary=frame",
-    )
+    async def gen():
+        global _stream_clients
+        _stream_clients += 1
+        try:
+            last = None
+            while True:
+                jpeg = rt.jpeg
+                if jpeg is not None and jpeg is not last:
+                    last = jpeg
+                    yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n"
+                await asyncio.sleep(0.03)
+        finally:
+            _stream_clients -= 1
 
-
-@app.post("/api/demo/toggle", tags=["Demo"])
-async def toggle_demo() -> Dict[str, Any]:
-    """Toggle demo mode on or off."""
-    settings.DEMO_MODE = not settings.DEMO_MODE
-    camera_manager._demo_mode = settings.DEMO_MODE
-    detection_engine._demo_mode = settings.DEMO_MODE
-    hardware_manager._demo_mode = settings.DEMO_MODE
-    logger.info("Demo mode toggled to %s", settings.DEMO_MODE)
-    return {"demo_mode": settings.DEMO_MODE}
-
-
-# ---------------------------------------------------------------------------
-# WebSocket Endpoint
-# ---------------------------------------------------------------------------
+    return StreamingResponse(gen(), media_type="multipart/x-mixed-replace; boundary=frame",
+                             headers={"Cache-Control": "no-store"})
 
 
 @app.websocket("/ws/telemetry")
-async def websocket_telemetry(websocket: WebSocket) -> None:
-    """Accept a WebSocket connection for continuous telemetry streaming."""
-    await ws_manager.connect(websocket)
+async def ws_telemetry(websocket: WebSocket) -> None:
+    await rt.ws.connect(websocket)
     try:
         while True:
-            # Keep the connection alive; optionally receive client messages
-            data = await websocket.receive_text()
-            # Clients may send "ping" to keep alive
-            if data.strip().lower() == "ping":
+            if (await websocket.receive_text()).strip().lower() == "ping":
                 await websocket.send_json({"pong": True})
     except WebSocketDisconnect:
-        ws_manager.disconnect(websocket)
-    except Exception:
-        ws_manager.disconnect(websocket)
+        pass
+    finally:
+        rt.ws.disconnect(websocket)

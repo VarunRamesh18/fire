@@ -1,111 +1,49 @@
-import { Gauge, Info, AlertTriangle } from 'lucide-react';
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
+import { Gauge, Info } from 'lucide-react';
+import { LineChart, Line, CartesianGrid, Tooltip, ResponsiveContainer, YAxis, XAxis } from 'recharts';
+import { fmt } from '../../lib/pipeline';
 
-function CustomTooltip({ active, payload, label }) {
-  if (!active || !payload?.length) return null;
-  return (
-    <div className="bg-[#1a1f2e] border border-[#2a3142] rounded-lg px-3 py-2 shadow-xl">
-      <p className="text-[10px] text-gray-400 mb-1">{label}</p>
-      {payload.map((p, i) => (
-        <p key={i} className="text-xs font-mono text-orange-400">
-          {p.value?.toFixed(2)} bar
-        </p>
-      ))}
-    </div>
-  );
-}
-
-export default function PressurePanel({ telemetry, pressureHistory = [] }) {
-  const t = telemetry;
-  const pressureBar = t?.estimated_pressure_bar;
-  const pressurePsi = t?.estimated_pressure_psi;
-  const distance = t?.distance_m;
-
-  const chartData = pressureHistory.slice(-60).map((item, idx) => ({
-    name: idx.toString(),
-    pressure: item.estimated_pressure_bar,
-  }));
+export default function PressurePanel({ telemetry: t, pressureHistory = [] }) {
+  const h = t?.pipeline?.hydraulics;
+  const sup = t?.pipeline?.suppression ?? {};
+  const data = pressureHistory.slice(-160).map((p, i) => ({ i, pump: p.pump_bar }));
 
   return (
     <div className="bg-[#1a1f2e] rounded-xl border border-[#2a3142] p-6">
-      {/* Header */}
       <div className="flex items-center justify-between mb-5">
         <div className="flex items-center gap-2">
           <Gauge className="w-5 h-5 text-orange-400" />
-          <span className="text-sm font-semibold uppercase tracking-wider text-gray-200">
-            Estimated Pressure
-          </span>
+          <span className="text-sm font-semibold uppercase tracking-wider text-gray-200">Pressure & Suppression</span>
         </div>
-        <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-blue-500/10 border border-blue-500/20">
-          <Info className="w-3 h-3 text-blue-400" />
-          <span className="text-[10px] font-medium text-blue-400">Calculated — Not Measured</span>
+        <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-teal-500/10 border border-teal-500/20">
+          <Info className="w-3 h-3 text-teal-300" />
+          <span className="text-[10px] font-medium text-teal-300">Physics model: projectile + Bernoulli + Darcy–Weisbach</span>
         </div>
       </div>
-
       <div className="grid grid-cols-1 lg:grid-cols-5 gap-6">
-        {/* Left - Values */}
-        <div className="lg:col-span-2 space-y-4">
-          <div>
-            <p className="text-[10px] uppercase tracking-wider text-gray-500 mb-1">Fire Distance</p>
-            <div className="flex items-baseline gap-1.5">
-              <span className="text-3xl font-mono font-bold text-white tabular-nums">
-                {distance != null ? distance.toFixed(2) : '—'}
-              </span>
-              <span className="text-sm text-gray-400">m</span>
+        <div className="lg:col-span-2 grid grid-cols-2 gap-3 content-start">
+          {[
+            ['Fire distance', fmt(t?.distance_m, 2), 'm'],
+            ['Required pump', fmt(h?.pump_pressure_bar, 2), 'bar'],
+            ['Jet velocity', fmt(h?.jet_velocity_ms, 2), 'm/s'],
+            ['Design flow', fmt(h?.flow_lpm, 1), 'L/min'],
+            ['Pump (live)', fmt(sup.pump_pressure_bar, 2), 'bar'],
+            ['Water used', fmt(sup.water_used_l, 2), 'L'],
+          ].map(([label, value, unit]) => (
+            <div key={label} className="p-3 rounded-lg bg-[#252b3b]">
+              <p className="text-[10px] uppercase tracking-wider text-gray-500 mb-1">{label}</p>
+              <p className="text-xl font-mono font-bold text-orange-400 tabular-nums">{value}<span className="text-xs text-gray-400 ml-1">{unit}</span></p>
             </div>
-          </div>
-
-          <div className="grid grid-cols-2 gap-3">
-            <div className="p-3 rounded-lg bg-[#252b3b]">
-              <p className="text-[10px] uppercase tracking-wider text-gray-500 mb-1">Pressure</p>
-              <div className="flex items-baseline gap-1">
-                <span className="text-xl font-mono font-bold text-orange-400 tabular-nums">
-                  {pressureBar != null ? pressureBar.toFixed(2) : '—'}
-                </span>
-                <span className="text-xs text-gray-400">bar</span>
-              </div>
-            </div>
-            <div className="p-3 rounded-lg bg-[#252b3b]">
-              <p className="text-[10px] uppercase tracking-wider text-gray-500 mb-1">PSI</p>
-              <div className="flex items-baseline gap-1">
-                <span className="text-xl font-mono font-bold text-orange-400 tabular-nums">
-                  {pressurePsi != null ? pressurePsi.toFixed(1) : '—'}
-                </span>
-                <span className="text-xs text-gray-400">PSI</span>
-              </div>
-            </div>
-          </div>
-
-          <div className="flex items-center gap-2 p-2.5 rounded-lg bg-yellow-500/5 border border-yellow-500/10">
-            <AlertTriangle className="w-3.5 h-3.5 text-yellow-500 flex-shrink-0" />
-            <p className="text-[10px] text-yellow-400/80 leading-tight">
-              Placeholder formula — pending calibration with actual hardware measurements
-            </p>
-          </div>
+          ))}
         </div>
-
-        {/* Right - Chart */}
         <div className="lg:col-span-3">
-          <p className="text-[10px] uppercase tracking-wider text-gray-500 mb-2">Pressure Over Time</p>
+          <p className="text-[10px] uppercase tracking-wider text-gray-500 mb-2">Live pump pressure (bar)</p>
           <ResponsiveContainer width="100%" height={200}>
-            <LineChart data={chartData}>
+            <LineChart data={data}>
               <CartesianGrid strokeDasharray="3 3" stroke="#2a3142" />
-              <XAxis dataKey="name" hide />
-              <YAxis
-                stroke="#64748b"
-                fontSize={10}
-                tickFormatter={(v) => `${v}`}
-                domain={['auto', 'auto']}
-              />
-              <Tooltip content={<CustomTooltip />} />
-              <Line
-                type="monotone"
-                dataKey="pressure"
-                stroke="#f97316"
-                strokeWidth={2}
-                dot={false}
-                activeDot={{ r: 3, fill: '#f97316' }}
-              />
+              <XAxis dataKey="i" hide />
+              <YAxis stroke="#64748b" fontSize={10} domain={[0, 'auto']} />
+              <Tooltip contentStyle={{ background: '#1a1f2e', border: '1px solid #2a3142', fontSize: 11 }} formatter={(v) => [`${Number(v).toFixed(2)} bar`, 'pump']} labelFormatter={() => ''} />
+              <Line type="monotone" dataKey="pump" stroke="#38bdf8" strokeWidth={2} dot={false} isAnimationActive={false} />
             </LineChart>
           </ResponsiveContainer>
         </div>
@@ -113,4 +51,3 @@ export default function PressurePanel({ telemetry, pressureHistory = [] }) {
     </div>
   );
 }
-

@@ -1,81 +1,60 @@
-const API_BASE = 'http://localhost:8000';
+// All requests are same-origin: the Vite dev/preview server proxies /api and /ws to the
+// FastAPI backend, so the dashboard also works when opened from another device.
+const API_BASE = '';
 
 async function request(endpoint, options = {}) {
-  const url = `${API_BASE}${endpoint}`;
+  let response;
   try {
-    const response = await fetch(url, {
-      headers: { 'Content-Type': 'application/json', ...options.headers },
+    response = await fetch(`${API_BASE}${endpoint}`, {
       ...options,
+      headers: { 'Content-Type': 'application/json', ...options.headers },
     });
-    if (!response.ok) {
-      throw new Error(`API Error: ${response.status} ${response.statusText}`);
-    }
-    return response;
-  } catch (error) {
-    if (error.name === 'TypeError' && error.message.includes('fetch')) {
-      throw new Error('Backend server is not reachable. Ensure the FastAPI server is running on port 8000.');
-    }
-    throw error;
+  } catch {
+    throw new Error('Backend server is not reachable. Ensure the FastAPI server is running on port 8000.');
   }
+  if (!response.ok) {
+    let detail = `${response.status} ${response.statusText}`;
+    try {
+      const body = await response.json();
+      if (body?.detail) detail = typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail);
+    } catch { /* not JSON */ }
+    throw new Error(detail);
+  }
+  return response;
 }
 
-export async function getStatus() {
-  const res = await request('/api/status');
-  return res.json();
+const json = (p) => p.then((r) => r.json());
+const post = (endpoint, body) => json(request(endpoint, { method: 'POST', body: JSON.stringify(body ?? {}) }));
+
+export const getStatus = () => json(request('/api/status'));
+export const getLatestTelemetry = () => json(request('/api/telemetry/latest'));
+
+function qs(params = {}) {
+  const q = new URLSearchParams();
+  Object.entries(params).forEach(([k, v]) => { if (v !== undefined && v !== null && v !== '') q.set(k, v); });
+  const s = q.toString();
+  return s ? `?${s}` : '';
 }
 
-export async function getLatestTelemetry() {
-  const res = await request('/api/telemetry/latest');
-  return res.json();
-}
+export const getEvents = (params) => json(request(`/api/events${qs(params)}`));
+export const getIncidents = (params) => json(request(`/api/incidents${qs(params)}`));
+export const getEventStats = () => json(request('/api/events/stats'));
+export const exportEventsCSV = () => request('/api/events/export/csv').then((r) => r.blob());
 
-export async function getEvents(params = {}) {
-  const query = new URLSearchParams();
-  if (params.limit) query.set('limit', params.limit);
-  if (params.offset) query.set('offset', params.offset);
-  if (params.start_date) query.set('start_date', params.start_date);
-  if (params.end_date) query.set('end_date', params.end_date);
-  const qs = query.toString();
-  const res = await request(`/api/events${qs ? `?${qs}` : ''}`);
-  return res.json();
-}
+export const getSettings = () => json(request('/api/settings'));
+export const updateSettings = (values) => post('/api/settings', values);
+export const toggleDemoMode = () => post('/api/demo/toggle');
+export const getSensors = () => json(request('/api/sensors'));
 
-export async function getEventStats() {
-  const res = await request('/api/events/stats');
-  return res.json();
-}
+export const getScenario = () => json(request('/api/scenario'));
+export const scenarioAction = (action, extra = {}) => post('/api/scenario', { action, ...extra });
+export const resetPipeline = () => post('/api/pipeline/reset');
 
-export async function exportEventsCSV() {
-  const res = await request('/api/events/export/csv');
-  return res.blob();
-}
+export const getCameraStreamUrl = () => `${API_BASE}/api/stream/camera`;
 
-export async function getSettings() {
-  const res = await request('/api/settings');
-  return res.json();
-}
-
-export async function updateSettings(settings) {
-  const res = await request('/api/settings', {
-    method: 'POST',
-    body: JSON.stringify(settings),
-  });
-  return res.json();
-}
-
-export async function getSensors() {
-  const res = await request('/api/sensors');
-  return res.json();
-}
-
-export async function toggleDemoMode() {
-  const res = await request('/api/demo/toggle', { method: 'POST' });
-  return res.json();
-}
-
-export function getCameraStreamUrl() {
-  return `${API_BASE}/api/stream/camera`;
+export function getWebSocketUrl() {
+  const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+  return `${proto}://${window.location.host}/ws/telemetry`;
 }
 
 export { API_BASE };
-
