@@ -76,10 +76,17 @@ npm run dev -- --host
 
 Open **http://localhost:3000**. The backend API docs are at http://localhost:8000/docs.
 
-### Demo assets (not in git — they are large)
+### Demo assets
 
-1. **Model:** copy the trained weights to `backend/models/best.pt`.
-2. **Video clips:** convert them once (this downscales to 960 px and writes `media/clips.json`):
+The repository already includes everything the demo needs:
+
+* `backend/models/best.pt` - trained YOLOv8 weights (classes `fire`, `smoke`)
+* `backend/media/bonfire.mp4` - fire clip
+* `backend/media/highway.mp4` - normal scene
+
+These cover every scenario (fire, false alarm, smoke only, escalation). To add more clips (`clips.json` also
+lists `campfire` and `city-road`, which appear once their files exist), convert them once. This downscales to
+960 px and updates `media/clips.json`:
 
 ```bat
 cd backend

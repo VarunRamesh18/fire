@@ -40,6 +40,9 @@ Thumbs.db
 # FireGuard runtime data
 *.db
 backend/runtime_settings.json
-# demo media and model weights are large - see README "Demo assets"
+# demo media and model weights are large: only the assets the demo needs are committed
 backend/media/*.mp4
+!backend/media/bonfire.mp4
+!backend/media/highway.mp4
 backend/models/*.pt
+!backend/models/best.pt
